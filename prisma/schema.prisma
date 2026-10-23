@@ -1,0 +1,366 @@
+// Iklib — shared Prisma schema (used by BOTH backend-admin and backend-student).
+// Full-text (tsvector) + pgvector similarity are added via prisma/extensions.sql
+// because Prisma cannot author generated columns / vector indexes natively.
+//
+// Multi-tenant model:
+//   University  (tenant root)
+//     ├── LevelType   (e.g. "School", "Department", "Module")
+//     │     defines name, order, and per-level custom field schema
+//     ├── HierarchyLevel  (a single node in the academic hierarchy)
+//     │     self-referential via parentId
+//     └── UserUniversity  (a user's membership/role in a university)
+//
+// ExamPaper, Question, Petition, etc. reference the leaf HierarchyLevel.
+// They carry a denormalized universityId for fast tenant filtering.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model University {
+  id          String   @id @default(cuid())
+  name        String
+  code        String   @unique // e.g. UNIMTECH — used in login
+  description String?
+  website     String?
+  logoUrl     String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  levelTypes      LevelType[]
+  hierarchyLevels HierarchyLevel[]
+  userLinks       UserUniversity[]
+  examPapers      ExamPaper[]
+  petitions       Petition[]
+}
+
+// A "kind" of hierarchy node. Per university, the admin defines which
+// level types exist, in what order, with what custom fields.
+model LevelType {
+  id           String   @id @default(cuid())
+  universityId String
+  university   University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+
+  // Display name chosen by the university, e.g. "School", "Faculty", "Wing"
+  name         String
+  // Lower number = closer to the root of the hierarchy
+  order        Int
+  // Optional plural form for UI: "Schools", "Faculties", "Wings"
+  pluralName   String?
+  // Optional description shown in admin UI
+  description  String?
+
+  // JSON Schema describing custom fields that nodes of this level carry.
+  // Example: { "fields": [ { "key": "code", "label": "Code", "type": "string", "required": true }, ... ] }
+  // Type values: string | text | number | boolean | date | select
+  fieldSchema  Json     @default("{\"fields\":[]}")
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  nodes        HierarchyLevel[]
+
+  @@unique([universityId, name])
+  @@index([universityId, order])
+}
+
+// One node in the academic hierarchy. A node is an instance of a LevelType.
+// Nodes have a single parent (except the root nodes, which have parentId = null).
+model HierarchyLevel {
+  id           String   @id @default(cuid())
+  universityId String
+  university   University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  levelTypeId  String
+  levelType    LevelType @relation(fields: [levelTypeId], references: [id], onDelete: Restrict)
+  parentId     String?
+  parent       HierarchyLevel? @relation("HierarchyChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children     HierarchyLevel[] @relation("HierarchyChildren")
+
+  name         String
+  // Custom fields whose values are stored in fieldValues keyed by LevelType.fieldSchema[*].key
+  fieldValues  Json     @default("{}")
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Reverse relations
+  examPapers   ExamPaper[]
+  petitions    Petition[]
+  questions    Question[]
+
+  @@index([universityId])
+  @@index([levelTypeId])
+  @@index([parentId])
+}
+
+// A user's membership in a university. A single User can belong to many
+// universities with different roles (e.g. student in one, lecturer in another).
+model UserUniversity {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  universityId String
+  university   University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+
+  // Role within THIS university: student | lecturer | sub_admin | admin
+  // (super_admin is a platform-level role on User, not a university role)
+  role         String   @default("student")
+
+  // The schoolIdNumber prefix that this user was issued within this
+  // university. Combined with universityId it is the unique login key.
+  // Mirrors User.schoolIdNumber so a user has one per university.
+  schoolIdNumber String?
+  admissionYear  Int?
+  idNumber       String?
+
+  // If set, this user is the primary admin of the university.
+  // At most one such row per university (enforced in service layer).
+  isPrimaryAdmin Boolean @default(false)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([universityId, schoolIdNumber])
+  @@unique([universityId, userId])
+  @@index([userId])
+  @@index([universityId, role])
+}
+
+model ExamPaper {
+  id            String   @id @default(cuid())
+  title         String
+  // Denormalized name of the leaf hierarchy node for full-text search
+  hierarchyName String
+  hierarchyLevelId String
+  hierarchyLevel   HierarchyLevel @relation(fields: [hierarchyLevelId], references: [id], onDelete: Cascade)
+  universityId  String
+  university    University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  year          Int
+  examType      String
+  semester      String?
+  duration      String?
+  instructions  String?
+  fileKeys      String[]
+  fileUrls      String[]
+  uploadedById  String?
+  reviewedById  String?
+  status        String   @default("draft")
+  downloadCount Int      @default(0)
+  duplicateFlag Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  publishedAt   DateTime?
+
+  // Student-view template fields
+  examDate        DateTime?
+  totalMarks      Int?
+  sectionHeaders  Json?
+  numberingStyle  String?     @default("Q1")
+
+  questions     Question[]
+  bookmarks     Bookmark[]
+  notifications Notification[]
+  uploadedBy    User?     @relation("UploadedBy", fields: [uploadedById], references: [id])
+  reviewedBy    User?     @relation("ReviewedBy", fields: [reviewedById], references: [id])
+
+  @@index([hierarchyLevelId, year])
+  @@index([universityId, status])
+}
+
+model Question {
+  id              String   @id @default(cuid())
+  examPaperId     String
+  examPaper       ExamPaper @relation(fields: [examPaperId], references: [id], onDelete: Cascade)
+  hierarchyLevelId String
+  hierarchyLevel   HierarchyLevel @relation(fields: [hierarchyLevelId], references: [id], onDelete: Cascade)
+  universityId    String
+  text            String
+  marks           Int?
+  order           Int      @default(0)
+  // Source and AI answer generation flag
+  source           String?    // "ai" | "manual" | "parsed"
+  generateAiAnswer Boolean    @default(false)
+  embedding       Unsupported("vector(768)")?
+  aiAnswers       AiAnswer[]
+  comments        Comment[]
+  parts           QuestionPart[]
+  createdAt       DateTime @default(now())
+
+  @@index([hierarchyLevelId])
+  @@index([examPaperId])
+  @@index([universityId])
+}
+
+// Sub-parts of a question (e.g. Q1a, Q1b).
+model QuestionPart {
+  id         String   @id @default(cuid())
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  partLabel  String?  // e.g. "a", "b", "(a)", "Q1a"
+  text       String
+  marks      Int?
+  order      Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([questionId])
+}
+
+model User {
+  id                String   @id @default(cuid())
+  name              String
+  email             String   @unique
+  contact           String?
+  passwordHash      String
+
+  // Platform-level role: student | admin | super_admin
+  // (university-level roles live on UserUniversity)
+  role              String   @default("student")
+  verificationStatus String  @default("unverified")
+  points            Int      @default(0)
+  createdAt         DateTime @default(now())
+
+  refreshTokens     RefreshToken[]
+  verificationRequests VerificationRequest[]
+  bookmarks         Bookmark[]
+  comments          Comment[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  uploadedPapers    ExamPaper[] @relation("UploadedBy")
+  reviewedPapers    ExamPaper[] @relation("ReviewedBy")
+  aiExtractionDrafts AiExtractionDraft[]
+
+  // Multi-tenant memberships
+  universityLinks   UserUniversity[]
+
+  // Petitions filed by this user
+  petitions         Petition[]
+}
+
+model VerificationRequest {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  note         String?
+  idPhotoUrl   String?
+  channel      String   @default("in_app")
+  status       String   @default("pending")
+  reviewedById String?
+  reviewedAt   DateTime?
+  createdAt    DateTime @default(now())
+
+  @@index([status])
+}
+
+model AiAnswer {
+  id           String   @id @default(cuid())
+  questionId   String
+  question     Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  content      String
+  isAiGenerated Boolean @default(true)
+  modelVersion String
+  createdAt    DateTime @default(now())
+
+  @@index([questionId])
+}
+
+model Comment {
+  id           String   @id @default(cuid())
+  questionId   String
+  question     Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  authorId     String
+  author       User     @relation(fields: [authorId], references: [id])
+  text         String
+  upvotes      Int      @default(0)
+  markedHelpful Int     @default(0)
+  createdAt    DateTime @default(now())
+
+  @@index([questionId])
+}
+
+model Bookmark {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  examPaperId String
+  examPaper   ExamPaper @relation(fields: [examPaperId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, examPaperId])
+}
+
+model Notification {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message     String
+  read        Boolean  @default(false)
+  relatedType String?
+  relatedId   String?
+  examPaperId String?
+  examPaper   ExamPaper? @relation(fields: [examPaperId], references: [id])
+  createdAt   DateTime @default(now())
+
+  @@index([userId, read])
+}
+
+model Petition {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  universityId    String
+  university      University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  hierarchyLevelId String?
+  hierarchyLevel   HierarchyLevel? @relation(fields: [hierarchyLevelId], references: [id])
+  year            Int?
+  examType        String?
+  note            String?
+  status          String   @default("open")
+  handledById     String?
+  createdAt       DateTime @default(now())
+
+  @@index([status])
+  @@index([universityId, status])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  actor      User     @relation(fields: [actorId], references: [id])
+  actorRole  String
+  action     String
+  targetType String
+  targetId   String?
+  meta       Json?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId])
+  @@index([createdAt])
+}
+
+model AiExtractionDraft {
+  id           String   @id @default(cuid())
+  uploadedById String
+  uploadedBy   User     @relation(fields: [uploadedById], references: [id])
+  rawFiles     Json
+  structured   Json
+  status       String   @default("pending")
+  createdAt    DateTime @default(now())
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  familyId  String
+  revoked   Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
